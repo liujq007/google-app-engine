@@ -109,6 +109,7 @@ def ValidateString(value,
   if len(value.encode('utf-8')) > max_len:
     raise exception('%s must be under %d bytes.' % (name, max_len))
 
+
 def ValidateInteger(value,
                    name='unused',
                    exception=datastore_errors.BadValueError,
@@ -138,6 +139,7 @@ def ValidateInteger(value,
     raise exception('%s must not be 0 (zero)' % name)
   if value < 0 and not negative_ok:
     raise exception('%s must not be negative.' % name)
+
 
 def ResolveAppId(app, name='_app'):
   """Validate app id, providing a default.
@@ -271,6 +273,7 @@ def parse_app_id_namespace(app_id_namespace):
     return AppIdNamespace(parts[0], parts[2])
   return AppIdNamespace(parts[0], None)
 
+
 def ResolveAppIdNamespace(
     app_id=None, namespace=None, app_id_namespace=None):
   """Validate an app id/namespace and substitute default values.
@@ -292,7 +295,7 @@ def ResolveAppIdNamespace(
     if app_id is None:
       app_id = os.environ.get('APPLICATION_ID', '')
     if namespace is None:
-      namespace = namespace_manager.get_request_namespace();
+      namespace = namespace_manager.get_namespace();
   else:
     if not app_id is None:
       raise datastore_errors.BadArgumentError(
@@ -638,13 +641,17 @@ class Key(object):
     Returns:
       string
     """
-    if self._str is None:
-      if (self.has_id_or_name()):
-        encoded = base64.urlsafe_b64encode(self.__reference.Encode())
-        self._str = encoded.replace('=', '')
-      else:
-        raise datastore_errors.BadKeyError(
-          'Cannot string encode an incomplete key!\n%s' % self.__reference)
+    try:
+      if self._str is not None:
+        return self._str
+    except AttributeError:
+      pass
+    if (self.has_id_or_name()):
+      encoded = base64.urlsafe_b64encode(self.__reference.Encode())
+      self._str = encoded.replace('=', '')
+    else:
+      raise datastore_errors.BadKeyError(
+        'Cannot string encode an incomplete key!\n%s' % self.__reference)
     return self._str
 
 
@@ -1127,9 +1134,7 @@ class BlobKey(object):
 
   This object wraps a string that gets used internally by the Blobstore API
   to identify application blobs.  The BlobKey corresponds to the entity name
-  of the underlying BlobReference entity.  The structure of the key is:
-
-    _<blob-key>
+  of the underlying BlobReference entity.
 
   This class is exposed in the API in both google.appengine.ext.db and
   google.appengine.ext.blobstore.
@@ -1144,6 +1149,7 @@ class BlobKey(object):
     Args:
       blob_key:  Key name of BlobReference that this key belongs to.
     """
+    ValidateString(blob_key, 'blob-key')
     self.__blob_key = blob_key
 
   def __str__(self):
@@ -1159,10 +1165,7 @@ class BlobKey(object):
     Returns:
       string
     """
-    s = type(self).__module__
-    return '%s.%s(%r)' % (type(self).__module__,
-                       type(self).__name__,
-                       self.__blob_key)
+    return 'datastore_types.%s(%r)' % (type(self).__name__, self.__blob_key)
 
   def __cmp__(self, other):
     if type(other) is type(self):
@@ -1224,6 +1227,7 @@ _PROPERTY_TYPES = frozenset([
 ])
 
 _RAW_PROPERTY_TYPES = (Blob, Text)
+_RAW_PROPERTY_MEANINGS = (entity_pb.Property.BLOB, entity_pb.Property.TEXT)
 
 def ValidatePropertyInteger(name, value):
   """Raises an exception if the supplied integer is invalid.
@@ -1324,7 +1328,7 @@ _VALIDATE_PROPERTY_VALUES = {
   type(None): ValidatePropertyNothing,
   unicode: ValidatePropertyString,
   users.User: ValidatePropertyNothing,
-  BlobKey: ValidatePropertyString,
+  BlobKey: ValidatePropertyNothing,
 }
 
 assert set(_VALIDATE_PROPERTY_VALUES.iterkeys()) == _PROPERTY_TYPES

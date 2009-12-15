@@ -63,6 +63,8 @@ import pickle
 import pprint
 import random
 import select
+import shutil
+import tempfile
 
 import re
 import sre_compile
@@ -82,13 +84,17 @@ from google.pyglib import gexcept
 
 from google.appengine.api import apiproxy_stub_map
 from google.appengine.api import appinfo
+from google.appengine.api import blobstore
 from google.appengine.api import croninfo
 from google.appengine.api import datastore_admin
 from google.appengine.api import datastore_file_stub
+from google.appengine.api import mail
 from google.appengine.api import mail_stub
 from google.appengine.api import urlfetch_stub
 from google.appengine.api import user_service_stub
 from google.appengine.api import yaml_errors
+from google.appengine.api.blobstore import blobstore_stub
+from google.appengine.api.blobstore import file_blob_storage
 from google.appengine.api.capabilities import capability_stub
 from google.appengine.api.labs.taskqueue import taskqueue_stub
 from google.appengine.api.memcache import memcache_stub
@@ -96,8 +102,10 @@ from google.appengine.api.xmpp import xmpp_service_stub
 
 from google.appengine import dist
 
+from google.appengine.tools import dev_appserver_blobstore
 from google.appengine.tools import dev_appserver_index
 from google.appengine.tools import dev_appserver_login
+from google.appengine.tools import dev_appserver_upload
 
 
 PYTHON_LIB_VAR = '$PYTHON_LIB'
@@ -115,22 +123,20 @@ FOOTER_TEMPLATE = 'logging_console_footer.html'
 DEFAULT_ENV = {
     'GATEWAY_INTERFACE': 'CGI/1.1',
     'AUTH_DOMAIN': 'gmail.com',
+    'USER_ORGANIZATION': '',
     'TZ': 'UTC',
 }
 
 DEFAULT_SELECT_DELAY = 30.0
 
-for ext, mime_type in (('.asc', 'text/plain'),
-                       ('.diff', 'text/plain'),
-                       ('.csv', 'text/comma-separated-values'),
-                       ('.rss', 'application/rss+xml'),
-                       ('.text', 'text/plain'),
-                       ('.wbmp', 'image/vnd.wap.wbmp')):
-  mimetypes.add_type(mime_type, ext)
+for ext, mime_type in mail.EXTENSION_MIME_MAP.iteritems():
+  mimetypes.add_type(mime_type, '.' + ext)
 
 MAX_RUNTIME_RESPONSE_SIZE = 10 << 20
 
 MAX_REQUEST_SIZE = 10 * 1024 * 1024
+
+COPY_BLOCK_SIZE = 1 << 20
 
 API_VERSION = '1'
 
@@ -191,16 +197,110 @@ def GetFullURL(server_name, server_port, relative_url):
     netloc = server_name
   return 'http://%s%s' % (netloc, relative_url)
 
+def CopyStreamPart(source, destination, content_size):
+  """Copy a portion of a stream from one file-like object to another.
+
+  Args:
+    source: Source stream to copy from.
+    destination: Destination stream to copy to.
+    content_size: Maximum bytes to copy.
+
+  Returns:
+    Number of bytes actually copied.
+  """
+  bytes_copied = 0
+  bytes_left = content_size
+  while bytes_left > 0:
+    bytes = source.read(min(bytes_left, COPY_BLOCK_SIZE))
+    bytes_read = len(bytes)
+    if bytes_read == 0:
+      break
+    destination.write(bytes)
+    bytes_copied += bytes_read
+    bytes_left -= bytes_read
+  return bytes_copied
+
+
+class AppServerRequest(object):
+  """Encapsulates app-server request.
+
+  Object used to hold a full appserver request.  Used as a container that is
+  passed through the request forward chain and ultimately sent to the
+  URLDispatcher instances.
+
+  Attributes:
+    relative_url: String containing the URL accessed.
+    path: Local path of the resource that was matched; back-references will be
+      replaced by values matched in the relative_url. Path may be relative
+      or absolute, depending on the resource being served (e.g., static files
+      will have an absolute path; scripts will be relative).
+    headers: Instance of mimetools.Message with headers from the request.
+    infile: File-like object with input data from the request.
+    force_admin: Allow request admin-only URLs to proceed regardless of whether
+      user is logged in or is an admin.
+  """
+
+  ATTRIBUTES = ['relative_url',
+                'path',
+                'headers',
+                'infile',
+                'force_admin',
+               ]
+
+  def __init__(self,
+               relative_url,
+               path,
+               headers,
+               infile,
+               force_admin=False):
+    """Constructor.
+
+    Args:
+      relative_url: Mapped directly to attribute.
+      path: Mapped directly to attribute.
+      headers: Mapped directly to attribute.
+      infile: Mapped directly to attribute.
+      force_admin: Mapped directly to attribute.
+    """
+    self.relative_url = relative_url
+    self.path = path
+    self.headers = headers
+    self.infile = infile
+    self.force_admin = force_admin
+
+  def __eq__(self, other):
+    """Used mainly for testing.
+
+    Returns:
+      True if all fields of both requests are equal, else False.
+    """
+    if type(self) == type(other):
+      for attribute in self.ATTRIBUTES:
+        if getattr(self, attribute) != getattr(other, attribute):
+          return False
+    return True
+
+  def __repr__(self):
+    """String representation of request.
+
+    Used mainly for testing.
+
+    Returns:
+      String representation of AppServerRequest.  Strings of different
+      request objects that have the same values for all fields compare
+      as equal.
+    """
+    results = []
+    for attribute in self.ATTRUBUTES:
+      results.append('%s: %s' % (attributes, getattr(self, attributes)))
+    return '<AppServerRequest %s>' % ' '.join(results)
 
 
 class URLDispatcher(object):
   """Base-class for handling HTTP requests."""
 
   def Dispatch(self,
-               relative_url,
-               path,
-               headers,
-               infile,
+               request,
                outfile,
                base_env_dict=None):
     """Dispatch and handle an HTTP request.
@@ -210,23 +310,14 @@ class URLDispatcher(object):
       SERVER_PROTOCOL, SERVER_PORT
 
     Args:
-      relative_url: String containing the URL accessed.
-      path: Local path of the resource that was matched; back-references will be
-        replaced by values matched in the relative_url. Path may be relative
-        or absolute, depending on the resource being served (e.g., static files
-        will have an absolute path; scripts will be relative).
-      headers: Instance of mimetools.Message with headers from the request.
-      infile: File-like object with input data from the request.
+      request: AppServerRequest instance.
       outfile: File-like object where output data should be written.
       base_env_dict: Dictionary of CGI environment parameters if available.
         Defaults to None.
 
     Returns:
       None if request handling is complete.
-      Tuple (path, headers, input_file) for an internal redirect:
-        path: Path of URL to redirect to.
-        headers: Headers to send to other dispatcher.
-        input_file: New input to send to new dispatcher.
+      A new AppServerRequest instance if internal redirect is required.
     """
     raise NotImplementedError
 
@@ -260,7 +351,8 @@ class URLMatcher(object):
     """Initializer."""
     self._url_patterns = []
 
-  def AddURL(self, regex, dispatcher, path, requires_login, admin_only):
+  def AddURL(self, regex, dispatcher, path, requires_login, admin_only,
+             auth_fail_action):
     """Adds a URL pattern to the list of patterns.
 
     If the supplied regex starts with a '^' or ends with a '$' an
@@ -279,6 +371,11 @@ class URLMatcher(object):
         URL; False if anyone can access this URL.
       admin_only: True if the user must be a logged-in administrator to
         access the URL; False if anyone can access the URL.
+      auth_fail_action: either appinfo.AUTH_FAIL_ACTION_REDIRECT (default)
+        which indicates that the server should redirect to the login page when
+        an authentication is needed, or appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED
+        which indicates that the server should just return a 401 Unauthorized
+        message immediately.
 
     Raises:
       TypeError: if dispatcher is not a URLDispatcher sub-class instance.
@@ -297,7 +394,8 @@ class URLMatcher(object):
     except re.error, e:
       raise InvalidAppConfigError('regex invalid: %s' % e)
 
-    match_tuple = (url_re, dispatcher, path, requires_login, admin_only)
+    match_tuple = (url_re, dispatcher, path, requires_login, admin_only,
+                   auth_fail_action)
     self._url_patterns.append(match_tuple)
 
   def Match(self,
@@ -313,23 +411,25 @@ class URLMatcher(object):
       split_url: Used for dependency injection.
 
     Returns:
-      Tuple (dispatcher, matched_path, requires_login, admin_only), which are
-      the corresponding values passed to AddURL when the matching URL pattern
-      was added to this matcher. The matched_path will have back-references
-      replaced using values matched by the URL pattern. If no match was found,
-      dispatcher will be None.
+      Tuple (dispatcher, matched_path, requires_login, admin_only,
+      auth_fail_action), which are the corresponding values passed to
+      AddURL when the matching URL pattern was added to this matcher.
+      The matched_path will have back-references replaced using values
+      matched by the URL pattern.  If no match was found, dispatcher will
+      be None.
     """
     adjusted_url, unused_query_string = split_url(relative_url)
 
     for url_tuple in self._url_patterns:
-      url_re, dispatcher, path, requires_login, admin_only = url_tuple
+      url_re, dispatcher, path, requires_login, admin_only, auth_fail_action = url_tuple
       the_match = url_re.match(adjusted_url)
 
       if the_match:
         adjusted_path = the_match.expand(path)
-        return dispatcher, adjusted_path, requires_login, admin_only
+        return (dispatcher, adjusted_path, requires_login, admin_only,
+                auth_fail_action)
 
-    return None, None, None, None
+    return None, None, None, None, None
 
   def GetDispatchers(self):
     """Retrieves the URLDispatcher objects that could be matched.
@@ -365,10 +465,7 @@ class MatcherDispatcher(URLDispatcher):
     self._login_redirect = login_redirect
 
   def Dispatch(self,
-               relative_url,
-               path,
-               headers,
-               infile,
+               request,
                outfile,
                base_env_dict=None):
     """Dispatches a request to the first matching dispatcher.
@@ -376,48 +473,52 @@ class MatcherDispatcher(URLDispatcher):
     Matchers are checked in the order they were supplied to the constructor.
     If no matcher matches, a 404 error will be written to the outfile. The
     path variable supplied to this method is ignored.
+
+    The value of request.path is ignored.
     """
-    cookies = ', '.join(headers.getheaders('cookie'))
+    cookies = ', '.join(request.headers.getheaders('cookie'))
     email_addr, admin, user_id = self._get_user_info(cookies)
 
     for matcher in self._url_matchers:
-      dispatcher, matched_path, requires_login, admin_only = matcher.Match(
-          relative_url)
+      dispatcher, matched_path, requires_login, admin_only, auth_fail_action = matcher.Match(request.relative_url)
       if dispatcher is None:
         continue
 
       logging.debug('Matched "%s" to %s with path %s',
-                    relative_url, dispatcher, matched_path)
+                    request.relative_url, dispatcher, matched_path)
 
-      if (requires_login or admin_only) and not email_addr:
+      if ((requires_login or admin_only) and
+          not email_addr and
+          not request.force_admin):
         logging.debug('Login required, redirecting user')
-        self._login_redirect(self._login_url,
-                             base_env_dict['SERVER_NAME'],
-                             base_env_dict['SERVER_PORT'],
-                             relative_url,
-                             outfile)
-      elif admin_only and not admin:
+        if auth_fail_action == appinfo.AUTH_FAIL_ACTION_REDIRECT:
+          self._login_redirect(self._login_url,
+                               base_env_dict['SERVER_NAME'],
+                               base_env_dict['SERVER_PORT'],
+                               request.relative_url,
+                               outfile)
+        elif auth_fail_action == appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED:
+          outfile.write('Status: %d Not authorized\r\n'
+                        '\r\n'
+                        'Login required to view page.'
+                        % (httplib.UNAUTHORIZED))
+      elif admin_only and not admin and not request.force_admin:
         outfile.write('Status: %d Not authorized\r\n'
                       '\r\n'
                       'Current logged in user %s is not '
                       'authorized to view this page.'
                       % (httplib.FORBIDDEN, email_addr))
       else:
-        forward = dispatcher.Dispatch(relative_url,
-                                      matched_path,
-                                      headers,
-                                      infile,
-                                      outfile,
-                                      base_env_dict=base_env_dict)
+        request.path = matched_path
+        forward_request = dispatcher.Dispatch(request,
+                                              outfile,
+                                              base_env_dict=base_env_dict)
 
-        if forward:
-          new_path, new_headers, new_input = forward
-          logging.info('Internal redirection to %s', new_path)
+        if forward_request:
+          logging.info('Internal redirection to %s',
+                       forward_request.relative_url)
           new_outfile = cStringIO.StringIO()
-          self.Dispatch(new_path,
-                        None,
-                        new_headers,
-                        new_input,
+          self.Dispatch(forward_request,
                         new_outfile,
                         dict(base_env_dict))
           new_outfile.seek(0)
@@ -429,7 +530,7 @@ class MatcherDispatcher(URLDispatcher):
                   '\r\n'
                   'Not found error: %s did not match any patterns '
                   'in application configuration.'
-                  % (httplib.NOT_FOUND, relative_url))
+                  % (httplib.NOT_FOUND, request.relative_url))
 
 
 
@@ -1272,6 +1373,7 @@ class HardenedModulesHook(object):
       '_lsprof',
       '_md5',
       '_multibytecodec',
+      '_scproxy',
       '_random',
       '_sha',
       '_sha256',
@@ -2021,6 +2123,31 @@ def LoadTargetModule(handler_path,
 
   return module_fullname, script_module, module_code
 
+def CheckRequestSize(request_size, outfile):
+  """Check that request size is below the maximum size.
+
+  Checks to see if the request size small enough for small requests.  Will
+  write the correct error message to the response outfile if the request
+  is too large.
+
+  Args:
+    request_size: Calculated size of request.
+    outfile: Response outfile.
+
+  Returns:
+    True if request size is ok, else False.
+  """
+  if request_size <= MAX_REQUEST_SIZE:
+    return True
+  else:
+    msg = ('HTTP request was too large: %d.  The limit is: %d.'
+           % (request_size, MAX_REQUEST_SIZE))
+    logging.error(msg)
+    outfile.write('Status: %d Request entity too large\r\n'
+                  '\r\n'
+                  '%s' % (httplib.REQUEST_ENTITY_TOO_LARGE, msg))
+    return False
+
 
 def ExecuteOrImportScript(handler_path, cgi_path, import_hook):
   """Executes a CGI script by importing it as a new module.
@@ -2132,13 +2259,13 @@ def ExecuteCGI(root_path,
 
   try:
     ClearAllButEncodingsModules(sys.modules)
+    before_path = sys.path[:]
     sys.modules.update(module_dict)
     sys.argv = [cgi_path]
     sys.stdin = cStringIO.StringIO(infile.getvalue())
     sys.stdout = outfile
     os.environ.clear()
     os.environ.update(env)
-    before_path = sys.path[:]
     cgi_dir = os.path.normpath(os.path.dirname(cgi_path))
     root_path = os.path.normpath(os.path.abspath(root_path))
     if cgi_dir.startswith(root_path + os.sep):
@@ -2219,13 +2346,18 @@ class CGIDispatcher(URLDispatcher):
     self._create_logging_handler = create_logging_handler
 
   def Dispatch(self,
-               relative_url,
-               path,
-               headers,
-               infile,
+               request,
                outfile,
                base_env_dict=None):
     """Dispatches the Python CGI."""
+    request_size = int(request.headers.get('content-length', 0))
+    if not CheckRequestSize(request_size, outfile):
+      return
+
+    memory_file = cStringIO.StringIO()
+    CopyStreamPart(request.infile, memory_file, request_size)
+    memory_file.seek(0)
+
     handler = self._create_logging_handler()
     logging.getLogger().addHandler(handler)
     before_level = logging.root.level
@@ -2233,16 +2365,19 @@ class CGIDispatcher(URLDispatcher):
       env = {}
       if base_env_dict:
         env.update(base_env_dict)
-      cgi_path = self._path_adjuster.AdjustPath(path)
-      env.update(self._setup_env(cgi_path, relative_url, headers, infile))
+      cgi_path = self._path_adjuster.AdjustPath(request.path)
+      env.update(self._setup_env(cgi_path,
+                                 request.relative_url,
+                                 request.headers,
+                                 memory_file))
       self._exec_cgi(self._root_path,
-                     path,
+                     request.path,
                      cgi_path,
                      env,
-                     infile,
+                     memory_file,
                      outfile,
                      self._module_dict)
-      handler.AddDebuggingConsole(relative_url, env, outfile)
+      handler.AddDebuggingConsole(request.relative_url, env, outfile)
     finally:
       logging.root.level = before_level
       logging.getLogger().removeHandler(handler)
@@ -2502,17 +2637,14 @@ class FileDispatcher(URLDispatcher):
     self._read_data_file = read_data_file
 
   def Dispatch(self,
-               relative_url,
-               path,
-               headers,
-               infile,
+               request,
                outfile,
                base_env_dict=None):
     """Reads the file and returns the response status and data."""
-    full_path = self._path_adjuster.AdjustPath(path)
+    full_path = self._path_adjuster.AdjustPath(request.path)
     status, data = self._read_data_file(full_path)
-    content_type = self._static_file_config_matcher.GetMimeType(path)
-    expiration = self._static_file_config_matcher.GetExpiration(path)
+    content_type = self._static_file_config_matcher.GetMimeType(request.path)
+    expiration = self._static_file_config_matcher.GetExpiration(request.path)
 
     outfile.write('Status: %d\r\n' % status)
     outfile.write('Content-type: %s\r\n' % content_type)
@@ -2531,11 +2663,81 @@ class FileDispatcher(URLDispatcher):
 
 _IGNORE_RESPONSE_HEADERS = frozenset([
     'content-encoding', 'accept-encoding', 'transfer-encoding',
-    'server', 'date',
+    'server', 'date', blobstore.BLOB_KEY_HEADER
     ])
 
 
-def IgnoreHeadersRewriter(status_code, status_message, headers, body):
+class AppServerResponse(object):
+  """Development appserver response object.
+
+  Object used to hold the full appserver response.  Used as a container
+  that is passed through the request rewrite chain and ultimately sent
+  to the web client.
+
+  Attributes:
+    status_code: Integer HTTP response status (e.g., 200, 302, 404, 500)
+    status_message: String containing an informational message about the
+      response code, possibly derived from the 'status' header, if supplied.
+    headers: mimetools.Message containing the HTTP headers of the response.
+    body: File-like object containing the body of the response.
+    large_response: Indicates that response is permitted to be larger than
+      MAX_RUNTIME_RESPONSE_SIZE.
+  """
+
+  __slots__ = ['status_code',
+               'status_message',
+               'headers',
+               'body',
+               'large_response']
+
+  def __init__(self, response_file=None, **kwds):
+    """Initializer.
+
+    Args:
+      response_file: A file-like object that contains the full response
+        generated by the user application request handler.  If present
+        the headers and body are set from this value, although the values
+        may be further overridden by the keyword parameters.
+      kwds: All keywords are mapped to attributes of AppServerResponse.
+    """
+    self.status_code = 200
+    self.status_message = 'Good to go'
+    self.large_response = False
+
+    if response_file:
+      self.SetResponse(response_file)
+    else:
+      self.headers = mimetools.Message(cStringIO.StringIO())
+      self.body = None
+
+    for name, value in kwds.iteritems():
+      setattr(self, name, value)
+
+  def SetResponse(self, response_file):
+    """Sets headers and body from the response file.
+
+    Args:
+      response_file: File like object to set body and headers from.
+    """
+    self.headers = mimetools.Message(response_file)
+    self.body = response_file
+
+  @property
+  def header_data(self):
+    """Get header data as a string.
+
+    Returns:
+      String representation of header with line breaks cleaned up.
+    """
+    header_list = []
+    for header in self.headers.headers:
+      header = header.rstrip('\n\r')
+      header_list.append(header)
+
+    return '\r\n'.join(header_list) + '\r\n'
+
+
+def IgnoreHeadersRewriter(response):
   """Ignore specific response headers.
 
   Certain response headers cannot be modified by an Application.  For a
@@ -2546,13 +2748,11 @@ def IgnoreHeadersRewriter(status_code, status_message, headers, body):
   This rewriter simply removes those headers.
   """
   for h in _IGNORE_RESPONSE_HEADERS:
-    if h in headers:
-      del headers[h]
-
-  return status_code, status_message, headers, body
+    if h in response.headers:
+      del response.headers[h]
 
 
-def ParseStatusRewriter(status_code, status_message, headers, body):
+def ParseStatusRewriter(response):
   """Parse status header, if it exists.
 
   Handles the server-side 'status' header, which instructs the server to change
@@ -2564,48 +2764,46 @@ def ParseStatusRewriter(status_code, status_message, headers, body):
   If the 'status' header supplied by the client is invalid, this method will
   set the response to a 500 with an error message as content.
   """
-  location_value = headers.getheader('location')
-  status_value = headers.getheader('status')
+  location_value = response.headers.getheader('location')
+  status_value = response.headers.getheader('status')
   if status_value:
     response_status = status_value
-    del headers['status']
+    del response.headers['status']
   elif location_value:
     response_status = '%d Redirecting' % httplib.FOUND
   else:
-    return status_code, status_message, headers, body
+    return response
 
   status_parts = response_status.split(' ', 1)
-  status_code, status_message = (status_parts + [''])[:2]
+  response.status_code, response.status_message = (status_parts + [''])[:2]
   try:
-    status_code = int(status_code)
+    response.status_code = int(response.status_code)
   except ValueError:
-    status_code = 500
-    body = cStringIO.StringIO('Error: Invalid "status" header value returned.')
+    response.status_code = 500
+    response.body = cStringIO.StringIO(
+        'Error: Invalid "status" header value returned.')
 
-  return status_code, status_message, headers, body
 
-
-def CacheRewriter(status_code, status_message, headers, body):
+def CacheRewriter(response):
   """Update the cache header."""
-  if not 'Cache-Control' in headers:
-    headers['Cache-Control'] = 'no-cache'
-    if not 'Expires' in headers:
-      headers['Expires'] = 'Fri, 01 Jan 1990 00:00:00 GMT'
-  return status_code, status_message, headers, body
+  if not 'Cache-Control' in response.headers:
+    response.headers['Cache-Control'] = 'no-cache'
+    if not 'Expires' in response.headers:
+      response.headers['Expires'] = 'Fri, 01 Jan 1990 00:00:00 GMT'
 
 
-def ContentLengthRewriter(status_code, status_message, headers, body):
+def ContentLengthRewriter(response):
   """Rewrite the Content-Length header.
 
   Even though Content-Length is not a user modifiable header, App Engine
   sends a correct Content-Length to the user based on the actual response.
   """
-  current_position = body.tell()
-  body.seek(0, 2)
+  current_position = response.body.tell()
+  response.body.seek(0, 2)
 
-  headers['Content-Length'] = str(body.tell() - current_position)
-  body.seek(current_position)
-  return status_code, status_message, headers, body
+  response.headers['Content-Length'] = str(response.body.tell() -
+                                           current_position)
+  response.body.seek(current_position)
 
 
 def CreateResponseRewritersChain():
@@ -2640,19 +2838,19 @@ def CreateResponseRewritersChain():
         files position is considered not to be part of the final body.
 
      Returns:
-      status_code: Rewritten status code or original.
-      status_message: Rewritter message or original.
-      headers: Rewritten/modified headers or original.
-      body: Rewritten/modified body or original.
+       An AppServerResponse instance.
 
   Returns:
     List of response rewriters.
   """
-  return [IgnoreHeadersRewriter,
-          ParseStatusRewriter,
-          CacheRewriter,
-          ContentLengthRewriter,
-         ]
+  rewriters = [dev_appserver_blobstore.DownloadRewriter,
+               IgnoreHeadersRewriter,
+               ParseStatusRewriter,
+               CacheRewriter,
+               ContentLengthRewriter,
+              ]
+  return rewriters
+
 
 
 def RewriteResponse(response_file, response_rewriters=None):
@@ -2674,36 +2872,16 @@ def RewriteResponse(response_file, response_rewriters=None):
       will create a new chain using CreateResponseRewritersChain.
 
   Returns:
-    Tuple (status_code, status_message, header, body) where:
-      status_code: Integer HTTP response status (e.g., 200, 302, 404, 500)
-      status_message: String containing an informational message about the
-        response code, possibly derived from the 'status' header, if supplied.
-      header: String containing the HTTP headers of the response, without
-        a trailing new-line (CRLF).
-      body: String containing the body of the response.
+    An AppServerResponse instance configured with the rewritten response.
   """
   if response_rewriters is None:
     response_rewriters = CreateResponseRewritersChain()
 
-  status_code = 200
-  status_message = 'Good to go'
-  headers = mimetools.Message(response_file)
-
+  response = AppServerResponse(response_file)
   for response_rewriter in response_rewriters:
-    status_code, status_message, headers, response_file = response_rewriter(
-        status_code,
-        status_message,
-        headers,
-        response_file)
+    response_rewriter(response)
 
-  header_list = []
-  for header in headers.headers:
-    header = header.rstrip('\n')
-    header = header.rstrip('\r')
-    header_list.append(header)
-
-  header_data = '\r\n'.join(header_list) + '\r\n'
-  return status_code, status_message, header_data, response_file.read()
+  return response
 
 
 
@@ -2910,6 +3088,45 @@ def CreateRequestHandler(root_path,
       """Handles TRACE requests."""
       self._HandleRequest()
 
+    def _Dispatch(self, dispatcher, socket_infile, outfile, env_dict):
+      """Copy request data from socket and dispatch.
+
+      Args:
+        dispatcher: Dispatcher to handle request (MatcherDispatcher).
+        socket_infile: Original request file stream.
+        outfile: Output file to write response to.
+        env_dict: Environment dictionary.
+      """
+      request_descriptor, request_file_name = tempfile.mkstemp('.tmp',
+                                                               'request.')
+
+      try:
+        request_file = os.fdopen(request_descriptor, 'wb')
+        try:
+          CopyStreamPart(self.rfile,
+                         request_file,
+                         int(self.headers.get('content-length', 0)))
+        finally:
+          request_file.close()
+
+        request_file = open(request_file_name, 'rb')
+        try:
+          app_server_request = AppServerRequest(self.path,
+                                                None,
+                                                self.headers,
+                                                request_file)
+          dispatcher.Dispatch(app_server_request,
+                              outfile,
+                              base_env_dict=env_dict)
+        finally:
+          request_file.close()
+      finally:
+        try:
+          os.remove(request_file_name)
+        except OSError, err:
+          if err.errno != errno.ENOENT:
+            raise
+
     def _HandleRequest(self):
       """Handles any type of request and prints exceptions if they occur."""
       server_name = self.headers.get('host') or self.server.server_name
@@ -2955,54 +3172,42 @@ def CreateRequestHandler(root_path,
         if require_indexes:
           dev_appserver_index.SetupIndexes(config.application, root_path)
 
-        infile = cStringIO.StringIO()
-        infile.write(self.rfile.read(
-            int(self.headers.get('content-length', 0))))
-        infile.seek(0)
-
-        request_size = len(infile.getvalue())
-        if request_size > MAX_REQUEST_SIZE:
-          msg = ('HTTP request was too large: %d.  The limit is: %d.'
-                 % (request_size, MAX_REQUEST_SIZE))
-          logging.error(msg)
-          self.send_response(httplib.REQUEST_ENTITY_TOO_LARGE, msg)
-          return
-
         outfile = cStringIO.StringIO()
         try:
-          dispatcher.Dispatch(self.path,
-                              None,
-                              self.headers,
-                              infile,
-                              outfile,
-                              base_env_dict=env_dict)
+          self._Dispatch(dispatcher, self.rfile, outfile, env_dict)
         finally:
           self.module_manager.UpdateModuleFileModificationTimes()
 
         outfile.flush()
         outfile.seek(0)
 
-        status_code, status_message, header_data, body = (
-            RewriteResponse(outfile, self.rewriter_chain))
+        response = RewriteResponse(outfile, self.rewriter_chain)
 
-        runtime_response_size = len(outfile.getvalue())
-        if runtime_response_size > MAX_RUNTIME_RESPONSE_SIZE:
-          status_code = 403
-          status_message = 'Forbidden'
-          new_headers = []
-          for header in header_data.split('\n'):
-            if not header.lower().startswith('content-length'):
-              new_headers.append(header)
-          header_data = '\n'.join(new_headers)
-          body = ('HTTP response was too large: %d.  The limit is: %d.'
-                  % (runtime_response_size, MAX_RUNTIME_RESPONSE_SIZE))
+        if not response.large_response:
+          position = response.body.tell()
+          response.body.seek(0, 2)
+          end = response.body.tell()
+          response.body.seek(position)
+          runtime_response_size = end - position
+
+          if runtime_response_size > MAX_RUNTIME_RESPONSE_SIZE:
+            response.status_code = 500
+            response.status_message = 'Forbidden'
+            if 'content-length' in response.headers:
+              del response.headers['content-length']
+            new_response = ('HTTP response was too large: %d.  '
+                            'The limit is: %d.'
+                            % (runtime_response_size,
+                               MAX_RUNTIME_RESPONSE_SIZE))
+            response.headers['content-length'] = str(len(new_response))
+            response.body = cStringIO.StringIO(new_response)
 
       except yaml_errors.EventListenerError, e:
         title = 'Fatal error when loading application configuration'
         msg = '%s:\n%s' % (title, str(e))
         logging.error(msg)
         self.send_response(httplib.INTERNAL_SERVER_ERROR, title)
-        self.wfile.write('Content-Type: text/html\n\n')
+        self.wfile.write('Content-Type: text/html\r\n\r\n')
         self.wfile.write('<pre>%s</pre>' % cgi.escape(msg))
       except:
         msg = 'Exception encountered handling request'
@@ -3011,12 +3216,12 @@ def CreateRequestHandler(root_path,
         tbhandler()
       else:
         try:
-          self.send_response(status_code, status_message)
-          self.wfile.write(header_data)
+          self.send_response(response.status_code, response.status_message)
+          self.wfile.write(response.header_data)
           self.wfile.write('\r\n')
           if self.command != 'HEAD':
-            self.wfile.write(body)
-          elif body:
+            shutil.copyfileobj(response.body, self.wfile, COPY_BLOCK_SIZE)
+          elif response.body:
             logging.warning('Dropping unexpected body in response '
                             'to HEAD request')
         except (IOError, OSError), e:
@@ -3118,6 +3323,7 @@ def CreateURLMatcherFromMaps(root_path,
   for url_map in url_map_list:
     admin_only = url_map.login == appinfo.LOGIN_ADMIN
     requires_login = url_map.login == appinfo.LOGIN_REQUIRED or admin_only
+    auth_fail_action = url_map.auth_fail_action
 
     handler_type = url_map.GetHandlerType()
     if handler_type == appinfo.HANDLER_SCRIPT:
@@ -3145,7 +3351,7 @@ def CreateURLMatcherFromMaps(root_path,
     url_matcher.AddURL(regex,
                        dispatcher,
                        path,
-                       requires_login, admin_only)
+                       requires_login, admin_only, auth_fail_action)
 
   return url_matcher
 
@@ -3273,6 +3479,7 @@ def SetupStubs(app_id, **config):
     root_path: Root path to the directory of the application which should
         contain the app.yaml, indexes.yaml, and queues.yaml files.
     login_url: Relative URL which should be used for handling user login/logout.
+    blobstore_path: Path to the directory to store Blobstore blobs in.
     datastore_path: Path to the file to store Datastore file stub data in.
     history_path: DEPRECATED, No-op.
     clear_datastore: If the datastore should be cleared on startup.
@@ -3289,6 +3496,7 @@ def SetupStubs(app_id, **config):
   """
   root_path = config.get('root_path', None)
   login_url = config['login_url']
+  blobstore_path = config['blobstore_path']
   datastore_path = config['datastore_path']
   clear_datastore = config['clear_datastore']
   require_indexes = config.get('require_indexes', False)
@@ -3373,13 +3581,20 @@ def SetupStubs(app_id, **config):
         'images',
         images_not_implemented_stub.ImagesNotImplementedServiceStub())
 
+  blob_storage = file_blob_storage.FileBlobStorage(blobstore_path, app_id)
+  apiproxy_stub_map.apiproxy.RegisterStub(
+      'blobstore',
+      blobstore_stub.BlobstoreServiceStub(blob_storage))
 
-def CreateImplicitMatcher(module_dict,
-                          root_path,
-                          login_url,
-                          create_path_adjuster=PathAdjuster,
-                          create_local_dispatcher=LocalCGIDispatcher,
-                          create_cgi_dispatcher=CGIDispatcher):
+
+def CreateImplicitMatcher(
+    module_dict,
+    root_path,
+    login_url,
+    create_path_adjuster=PathAdjuster,
+    create_local_dispatcher=LocalCGIDispatcher,
+    create_cgi_dispatcher=CGIDispatcher,
+    get_blob_storage=dev_appserver_blobstore.GetBlobStorage):
   """Creates a URLMatcher instance that handles internal URLs.
 
   Used to facilitate handling user login/logout, debugging, info about the
@@ -3392,6 +3607,7 @@ def CreateImplicitMatcher(module_dict,
     create_path_adjuster: Used for dependedency injection.
     create_local_dispatcher: Used for dependency injection.
     create_cgi_dispatcher: Used for dependedency injection.
+    get_blob_storage: Used for dependency injection.
 
   Returns:
     Instance of URLMatcher with appropriate dispatchers.
@@ -3405,7 +3621,8 @@ def CreateImplicitMatcher(module_dict,
                      login_dispatcher,
                      '',
                      False,
-                     False)
+                     False,
+                     appinfo.AUTH_FAIL_ACTION_REDIRECT)
 
   admin_dispatcher = create_cgi_dispatcher(module_dict, root_path,
                                            path_adjuster)
@@ -3413,7 +3630,18 @@ def CreateImplicitMatcher(module_dict,
                      admin_dispatcher,
                      DEVEL_CONSOLE_PATH,
                      False,
-                     False)
+                     False,
+                     appinfo.AUTH_FAIL_ACTION_REDIRECT)
+
+  upload_dispatcher = dev_appserver_blobstore.CreateUploadDispatcher(
+      get_blob_storage)
+
+  url_matcher.AddURL(dev_appserver_blobstore.UPLOAD_URL_PATTERN,
+                     upload_dispatcher,
+                     '',
+                     False,
+                     False,
+                     appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED)
 
   return url_matcher
 

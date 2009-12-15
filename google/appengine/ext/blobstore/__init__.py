@@ -15,12 +15,6 @@
 # limitations under the License.
 #
 
+"""Blobstore API module."""
 
-
-
-
-from deferred import *
-
-
-if __name__ == "__main__":
-  main()
+from blobstore import *
