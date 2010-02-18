@@ -64,6 +64,7 @@ import logging
 import re
 import sys
 import traceback
+import urllib
 import urlparse
 import webob
 import wsgiref.headers
@@ -490,8 +491,9 @@ class WSGIApplication(object):
 
     handler = None
     groups = ()
+    path = urllib.unquote(request.path)
     for regexp, handler_class in self._url_mapping:
-      match = regexp.match(request.path)
+      match = regexp.match(path)
       if match:
         handler = handler_class()
         handler.initialize(request, response)
