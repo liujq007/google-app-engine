@@ -60,7 +60,7 @@ def main(argv):
   parser.add_option('-s', '--server', dest='server',
                     help='The hostname your app is deployed on. '
                          'Defaults to <app_id>.appspot.com.')
-  (options, args) = parser.parse_args()
+  (options, args) = parser.parse_args(argv[1:])
 
   if not args or len(args) > 2:
     print >> sys.stderr, __doc__
