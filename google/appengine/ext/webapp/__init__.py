@@ -67,8 +67,11 @@ import traceback
 import urllib
 import urlparse
 import webob
+import wsgiref.handlers
 import wsgiref.headers
 import wsgiref.util
+
+wsgiref.handlers.BaseHandler.os_environ = {}
 
 RE_FIND_GROUPS = re.compile('\(.*?\)')
 _CHARSET_RE = re.compile(r';\s*charset=([^;\s]*)', re.I)
@@ -474,7 +477,8 @@ class WSGIApplication(object):
     """Initializes this application with the given URL mapping.
 
     Args:
-      url_mapping: list of (URI, RequestHandler) pairs (e.g., [('/', ReqHan)])
+      url_mapping: list of (URI regular expression, RequestHandler) pairs
+                   (e.g., [('/', ReqHan)])
       debug: if true, we send Python stack traces to the browser on errors
     """
     self._init_url_mappings(url_mapping)
@@ -543,12 +547,20 @@ class WSGIApplication(object):
 
     for regexp, handler in handler_tuples:
 
-      handler_map[handler.__name__] = handler
+      try:
+        handler_name = handler.__name__
+      except AttributeError:
+        pass
+      else:
+        handler_map[handler_name] = handler
 
       if not regexp.startswith('^'):
         regexp = '^' + regexp
       if not regexp.endswith('$'):
         regexp += '$'
+
+      if regexp == '^/form$':
+        logging.warning('The URL "/form" is reserved and will not be matched.')
 
       compiled = re.compile(regexp)
       url_mapping.append((compiled, handler))

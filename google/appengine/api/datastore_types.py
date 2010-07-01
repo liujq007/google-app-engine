@@ -118,9 +118,9 @@ def ValidateInteger(value,
                    negative_ok=False):
   """Raises an exception if value is not a valid integer.
 
-  An integer is valid if it's not negative or empty and is an integer.
-  The exception type can be specified with the exception argument;
-  it defaults to BadValueError.
+  An integer is valid if it's not negative or empty and is an integer
+  (either int or long).  The exception type raised can be specified
+  with the exception argument; it defaults to BadValueError.
 
   Args:
     value: the value to validate.
@@ -132,7 +132,7 @@ def ValidateInteger(value,
   """
   if value is None and empty_ok:
     return
-  if not isinstance(value, int):
+  if not isinstance(value, (int, long)):
     raise exception('%s should be an integer; received %s (a %s).' %
                     (name, value, typename(value)))
   if not value and not zero_ok:
@@ -175,10 +175,11 @@ def ResolveNamespace(namespace):
   Raises:
     BadArgumentError if the value is not a string.
   """
-  if not namespace:
-    namespace = namespace_manager.get_namespace();
-  ValidateString(
-    namespace, 'namespace', datastore_errors.BadArgumentError, empty_ok=True)
+  if namespace is None:
+    namespace = namespace_manager.get_namespace()
+  else:
+    namespace_manager.validate_namespace(
+        namespace, datastore_errors.BadArgumentError)
   return namespace
 
 
@@ -215,9 +216,9 @@ def PartitionString(value, separator):
     value: String to be partitioned
     separator: Separator string
   """
-  index = value.find(separator);
+  index = value.find(separator)
   if index == -1:
-    return (value, '', value[0:0]);
+    return (value, '', value[0:0])
   else:
     return (value[0:index], separator, value[index+len(separator):len(value)])
 
@@ -312,12 +313,9 @@ class Key(object):
     Args:
       kind: the entity kind (a str or unicode instance)
       id_or_name: the id (an int or long) or name (a str or unicode instance)
-
-    Additional positional arguments are allowed and should be
-    alternating kind and id/name.
-
-    Keyword args:
       parent: optional parent Key; default None.
+      namespace: optional namespace to use otherwise namespace_manager's
+        default namespace is used.
 
     Returns:
       A new Key instance whose .kind() and .id() or .name() methods return
@@ -329,7 +327,8 @@ class Key(object):
     """
     parent = kwds.pop('parent', None)
     app_id = ResolveAppId(kwds.pop('_app', None))
-    namespace = ResolveNamespace(kwds.pop('namespace', None))
+
+    namespace = kwds.pop('namespace', None)
 
     if kwds:
       raise datastore_errors.BadArgumentError(
@@ -345,14 +344,18 @@ class Key(object):
         raise datastore_errors.BadArgumentError(
             'Expected None or a Key as parent; received %r (a %s).' %
             (parent, typename(parent)))
+      if namespace is None:
+        namespace = parent.namespace()
       if not parent.has_id_or_name():
         raise datastore_errors.BadKeyError(
             'The parent Key is incomplete.')
       if app_id != parent.app() or namespace != parent.namespace():
         raise datastore_errors.BadArgumentError(
-            'The app/namespace arguments (%r) should match ' +
-            'parent.app/namespace() (%s)' %
-            ((app_id, namespace), (parent.app(), parent.namespace())))
+            'The app/namespace arguments (%s/%s) should match '
+            'parent.app/namespace() (%s/%s)' %
+            (app_id, namespace, parent.app(), parent.namespace()))
+
+    namespace = ResolveNamespace(namespace)
 
     key = Key()
     ref = key.__reference
@@ -394,11 +397,11 @@ class Key(object):
       return None
 
   def namespace(self):
-    """Returns this entity's app id, a string."""
+    """Returns this entity's namespace, a string."""
     if self.__reference.has_name_space():
       return self.__reference.name_space().decode('utf-8')
     else:
-      return None
+      return ''
 
   def kind(self):
     """Returns this entity's kind, as a string."""
@@ -581,7 +584,7 @@ class Key(object):
 
     args.append('_app=%r' % self.__reference.app().decode('utf-8'))
     if self.__reference.has_name_space():
-      args.append('_namespace=%r' %
+      args.append('namespace=%r' %
           self.__reference.name_space().decode('utf-8'))
     return u'datastore_types.Key.from_path(%s)' % ', '.join(args)
 
@@ -602,10 +605,10 @@ class Key(object):
     if not isinstance(other, Key):
       return -2
 
-    self_args = [self.__reference.app()]
+    self_args = [self.__reference.app(), self.__reference.name_space()]
     self_args += self.to_path(_default_id=0)
 
-    other_args = [other.__reference.app()]
+    other_args = [other.__reference.app(), other.__reference.name_space()]
     other_args += other.to_path(_default_id=0)
 
     for self_component, other_component in zip(self_args, other_args):
@@ -1371,6 +1374,14 @@ def PackUser(name, value, pbvalue):
     pbvalue.mutable_uservalue().set_obfuscated_gaiaid(
         value.user_id().encode('utf-8'))
 
+  if value.federated_identity() is not None:
+    pbvalue.mutable_uservalue().set_federated_identity(
+        value.federated_identity().encode('utf-8'))
+
+  if value.federated_provider() is not None:
+    pbvalue.mutable_uservalue().set_federated_provider(
+        value.federated_provider().encode('utf-8'))
+
 
 def PackKey(name, value, pbvalue):
   """Packs a reference property into a entity_pb.PropertyValue.
@@ -1574,9 +1585,16 @@ def FromPropertyPb(pb):
     auth_domain = unicode(pbval.uservalue().auth_domain().decode('utf-8'))
     obfuscated_gaiaid = pbval.uservalue().obfuscated_gaiaid().decode('utf-8')
     obfuscated_gaiaid = unicode(obfuscated_gaiaid)
+
+    federated_identity = None
+    if pbval.uservalue().has_federated_identity():
+      federated_identity = unicode(
+          pbval.uservalue().federated_identity().decode('utf-8'))
+
     value = users.User(email=email,
                        _auth_domain=auth_domain,
-                       _user_id=obfuscated_gaiaid)
+                       _user_id=obfuscated_gaiaid,
+                       federated_identity=federated_identity)
   else:
     value = None
 
@@ -1700,4 +1718,3 @@ def PropertyValueFromString(type_,
   elif type_ == type(None):
     return None
   return type_(value_string)
-

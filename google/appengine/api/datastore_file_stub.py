@@ -161,15 +161,27 @@ class _Cursor(object):
     if query.has_offset():
       offset += query.offset()
 
-    if offset > 0:
-      self.__last_result = results[offset - 1]
+    if offset > 0 and results:
+      self.__last_result = results[min(len(results), offset) - 1]
     else:
       self.__last_result = cursor_entity
 
+    last_index = None
+    if query.has_end_compiled_cursor():
+      (cursor_entity, inclusive) = self._DecodeCompiledCursor(
+          query, query.end_compiled_cursor())
+      last_index = _Cursor._GetCursorOffset(results,
+                                            cursor_entity,
+                                            inclusive,
+                                            order_compare_entities)
+
     if query.has_limit():
-      self.__results = results[offset:offset + query.limit()]
-    else:
-      self.__results = results[offset:]
+      if last_index is None:
+        last_index = query.limit() + offset
+      else:
+        last_index = min(last_index, query.limit() + offset)
+
+    self.__results = results[offset:last_index]
 
     self.__query = query
     self.__offset = 0
@@ -208,7 +220,7 @@ class _Cursor(object):
       while lo < hi:
         mid = (lo + hi) // 2
         if compare(results[mid], cursor_entity) < 0:
-           lo = mid + 1
+          lo = mid + 1
         else:
           hi = mid
     else:
@@ -313,8 +325,6 @@ class _Cursor(object):
           self.__last_result.ToPb().Encode()))
       position.set_start_key(str(start_key))
       position.set_start_inclusive(False)
-    elif self.__query.has_compiled_cursor:
-      compiled_cursor.CopyFrom(self.__query.compiled_cursor())
 
   def PopulateQueryResult(self, result, count, compile=False):
     """Populates a QueryResult with this cursor and the given number of results.
@@ -342,7 +352,8 @@ class _Cursor(object):
 
     result.set_more_results(self.__offset < self.count)
     if compile:
-      self._EncodeCompiledCursor(self.__query, result.mutable_compiled_cursor())
+      self._EncodeCompiledCursor(
+          self.__query, result.mutable_compiled_cursor())
 
 
 class DatastoreFileStub(apiproxy_stub.APIProxyStub):
@@ -1063,18 +1074,30 @@ class DatastoreFileStub(apiproxy_stub.APIProxyStub):
     self.__tx_snapshot = dict(snapshot)
     self.__tx_actions = []
 
-  def _Dynamic_AddAction(self, request, void):
-    self.__ValidateTransaction(request.transaction())
+  def _Dynamic_AddActions(self, request, _):
+    """Associates the creation of one or more tasks with a transaction.
 
-    if len(self.__tx_actions) >= _MAX_ACTIONS_PER_TXN:
+    Args:
+      request: A taskqueue_service_pb.TaskQueueBulkAddRequest containing the
+          tasks that should be created when the transaction is comitted.
+    """
+
+
+    if ((len(self.__tx_actions) + request.add_request_size()) >
+        _MAX_ACTIONS_PER_TXN):
       raise apiproxy_errors.ApplicationError(
           datastore_pb.Error.BAD_REQUEST,
           'Too many messages, maximum allowed %s' % _MAX_ACTIONS_PER_TXN)
 
-    clone = taskqueue_service_pb.TaskQueueAddRequest()
-    clone.CopyFrom(request)
-    clone.clear_transaction()
-    self.__tx_actions.append(clone)
+    new_actions = []
+    for add_request in request.add_request_list():
+      self.__ValidateTransaction(add_request.transaction())
+      clone = taskqueue_service_pb.TaskQueueAddRequest()
+      clone.CopyFrom(add_request)
+      clone.clear_transaction()
+      new_actions.append(clone)
+
+    self.__tx_actions.extend(new_actions)
 
   def _Dynamic_Commit(self, transaction, transaction_response):
     self.__ValidateTransaction(transaction)
@@ -1108,15 +1131,18 @@ class DatastoreFileStub(apiproxy_stub.APIProxyStub):
     app_str = req.app()
     self.__ValidateAppId(app_str)
 
+    namespace_str = req.name_space()
+    app_namespace_str = datastore_types.EncodeAppIdNamespace(app_str,
+                                                             namespace_str)
     kinds = []
 
-    for app, kind in self.__entities:
-      if (app != app_str or
+    for app_namespace, kind in self.__entities:
+      if (app_namespace != app_namespace_str or
           (req.has_start_kind() and kind < req.start_kind()) or
           (req.has_end_kind() and kind > req.end_kind())):
         continue
 
-      app_kind = (app, kind)
+      app_kind = (app_namespace_str, kind)
       if app_kind in self.__schema_cache:
         kinds.append(self.__schema_cache[app_kind])
         continue

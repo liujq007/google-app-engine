@@ -21,8 +21,10 @@ Library for parsing dos.yaml files and working with these in memory.
 """
 
 
+
 import google
 import ipaddr
+import re
 
 from google.appengine.api import validation
 from google.appengine.api import yaml_builder
@@ -39,17 +41,26 @@ SUBNET = 'subnet'
 class SubnetValidator(validation.Validator):
   """Checks that a subnet can be parsed and is a valid IPv4 or IPv6 subnet."""
 
-  def Validate(self, value):
+  def Validate(self, value, key=None):
     """Validates a subnet."""
     if value is None:
       raise validation.MissingAttribute('subnet must be specified')
+    if not isinstance(value, basestring):
+      raise validation.ValidationError('subnet must be a string, not \'%r\'' %
+                                       type(value))
     try:
-      ipaddr.IP(value)
+      ipaddr.IPNetwork(value)
     except ValueError:
       raise validation.ValidationError('%s is not a valid IPv4 or IPv6 subnet' %
                                        value)
-    else:
-      return value
+
+    parts = value.split('/')
+    if len(parts) == 2 and not re.match('^[0-9]+$', parts[1]):
+      raise validation.ValidationError('Prefix length of subnet %s must be an '
+                                       'integer (quad-dotted masks are not '
+                                       'supported)' % value)
+
+    return value
 
 
 class MalformedDosConfiguration(Exception):
