@@ -81,11 +81,20 @@ _txes = {}
 
 _ALLOWED_API_KWARGS = frozenset(['rpc'])
 
+_ALLOWED_FAILOVER_READ_METHODS = set(
+    ('Get', 'RunQuery', 'RunCompiledQuery', 'Count', 'Next'))
+
+ARBITRARY_FAILOVER_MS = -1
+
+STRONG_CONSISTENCY = 0
+EVENTUAL_CONSISTENCY = 1
+
+
 def NormalizeAndTypeCheck(arg, types):
   """Normalizes and type checks the given argument.
 
   Args:
-    arg: an instance, tuple, list, iterator, or generator of the given type(s)
+    arg: an instance or iterable of the given type(s)
     types: allowed type or tuple of types
 
   Returns:
@@ -104,20 +113,27 @@ def NormalizeAndTypeCheck(arg, types):
   assert list not in types and tuple not in types
 
   if isinstance(arg, types):
-    return ([arg], False)
+    return [arg], False
   else:
-    try:
-      for val in arg:
-        if not isinstance(val, types):
-          raise datastore_errors.BadArgumentError(
-              'Expected one of %s; received %s (a %s).' %
-              (types, val, typename(val)))
-    except TypeError:
+    if isinstance(arg, basestring):
       raise datastore_errors.BadArgumentError(
-          'Expected an instance or sequence of %s; received %s (a %s).' %
+          'Expected an instance or iterable of %s; received %s (a %s).' %
           (types, arg, typename(arg)))
 
-    return (list(arg), True)
+    try:
+      arg_list = list(arg)
+    except TypeError:
+      raise datastore_errors.BadArgumentError(
+          'Expected an instance or iterable of %s; received %s (a %s).' %
+          (types, arg, typename(arg)))
+
+    for val in arg_list:
+      if not isinstance(val, types):
+        raise datastore_errors.BadArgumentError(
+            'Expected one of %s; received %s (a %s).' %
+            (types, val, typename(val)))
+
+    return arg_list, True
 
 
 def NormalizeAndTypeCheckKeys(keys):
@@ -178,18 +194,21 @@ def _MakeSyncCall(service, call, request, response, rpc=None):
   return response
 
 
-def CreateRPC(service='datastore_v3', deadline=None, callback=None):
+def CreateRPC(service='datastore_v3', deadline=None, callback=None,
+              read_policy=STRONG_CONSISTENCY):
   """Create an rpc for use in configuring datastore calls.
 
   Args:
     deadline: float, deadline for calls in seconds.
     callback: callable, a callback triggered when this rpc completes,
       accepts one argument: the returned rpc.
+    read_policy: flag, set to EVENTUAL_CONSISTENCY to enable eventually
+      consistent reads
 
   Returns:
     A datastore.DatastoreRPC instance.
   """
-  return DatastoreRPC(service, deadline, callback)
+  return DatastoreRPC(service, deadline, callback, read_policy)
 
 
 class DatastoreRPC(apiproxy_stub_map.UserRPC):
@@ -203,6 +222,20 @@ class DatastoreRPC(apiproxy_stub_map.UserRPC):
   deadline, on API calls. It will be used to make the actual call.
   """
 
+  def __init__(self, service='datastore_v3', deadline=None, callback=None,
+               read_policy=STRONG_CONSISTENCY):
+    super(DatastoreRPC, self).__init__(service, deadline, callback)
+    self.read_policy = read_policy
+
+  def make_call(self, call, request, response):
+    if self.read_policy == EVENTUAL_CONSISTENCY:
+      if call not in _ALLOWED_FAILOVER_READ_METHODS:
+        raise datastore_errors.BadRequestError(
+            'read_policy is only supported on read operations.')
+      if call != 'Next':
+        request.set_failover_ms(ARBITRARY_FAILOVER_MS)
+    super(DatastoreRPC, self).make_call(call, request, response)
+
   def clone(self):
     """Make a shallow copy of this instance.
 
@@ -211,7 +244,8 @@ class DatastoreRPC(apiproxy_stub_map.UserRPC):
     developer's easy control.
     """
     assert self.state == apiproxy_rpc.RPC.IDLE
-    return self.__class__(self.service, self.deadline, self.callback)
+    return self.__class__(
+        self.service, self.deadline, self.callback, self.read_policy)
 
 
 def Put(entities, **kwargs):
@@ -368,7 +402,7 @@ class Entity(dict):
   provides dictionary-style access to properties.
   """
   def __init__(self, kind, parent=None, _app=None, name=None, id=None,
-               unindexed_properties=[], _namespace=None):
+               unindexed_properties=[], namespace=None, **kwds):
     """Constructor. Takes the kind and transaction root, which cannot be
     changed after the entity is constructed, and an optional parent. Raises
     BadArgumentError or BadKeyError if kind is invalid or parent is not an
@@ -386,12 +420,23 @@ class Entity(dict):
       # if provided, a sequence of property names that should not be indexed
       # by the built-in single property indices.
       unindexed_properties: list or tuple of strings
+      namespace: string
+      # if provided, overrides the default namespace_manager setting.
     """
     ref = entity_pb.Reference()
     _app = datastore_types.ResolveAppId(_app)
-    _namespace = datastore_types.ResolveNamespace(_namespace)
     ref.set_app(_app)
-    datastore_types.SetNamespace(ref, _namespace)
+
+    _namespace = kwds.pop('_namespace', None)
+    if kwds:
+      raise datastore_errors.BadArgumentError(
+          'Excess keyword arguments ' + repr(kwds))
+
+    if namespace is None:
+      namespace = _namespace
+    elif _namespace is not None:
+        raise datastore_errors.BadArgumentError(
+            "Must not set both _namespace and namespace parameters.")
 
     datastore_types.ValidateString(kind, 'kind',
                                    datastore_errors.BadArgumentError)
@@ -401,11 +446,16 @@ class Entity(dict):
         raise datastore_errors.BadArgumentError(
             " %s doesn't match parent's app %s" %
             (_app, parent.app()))
-      if _namespace != parent.namespace():
+      if namespace is None:
+        namespace = parent.namespace()
+      elif namespace != parent.namespace():
         raise datastore_errors.BadArgumentError(
             " %s doesn't match parent's namespace %s" %
-            (_namespace, parent.namespace()))
+            (namespace, parent.namespace()))
       ref.CopyFrom(parent._Key__reference)
+
+    namespace = datastore_types.ResolveNamespace(namespace)
+    datastore_types.SetNamespace(ref, namespace)
 
     last_path = ref.mutable_path().add_element()
     last_path.set_type(kind.encode('utf-8'))
@@ -699,12 +749,13 @@ class Entity(dict):
 
     unindexed_properties = [p.name() for p in pb.raw_property_list()]
 
-    namespace = pb.key().name_space()
-    if not namespace:
-      namespace = None
+    if pb.key().has_name_space():
+      namespace = pb.key().name_space()
+    else:
+      namespace = ''
     e = Entity(unicode(last_path.type().decode('utf-8')),
                unindexed_properties=unindexed_properties,
-               _app=pb.key().app(), _namespace=namespace)
+               _app=pb.key().app(), namespace=namespace)
     ref = e.__key._Key__reference
     ref.CopyFrom(pb.key())
 
@@ -716,8 +767,8 @@ class Entity(dict):
           value = datastore_types.FromPropertyPb(prop)
         except (AssertionError, AttributeError, TypeError, ValueError), e:
           raise datastore_errors.Error(
-            'Property %s is corrupt in the datastore. %s: %s' %
-            (e.__class__, prop.name(), e))
+            'Property %s is corrupt in the datastore:\n%s' %
+            (prop.name(), traceback.format_exc()))
 
         multiple = prop.multiple()
         if multiple:
@@ -727,7 +778,7 @@ class Entity(dict):
         cur_value = temporary_values.get(name)
         if cur_value is None:
           temporary_values[name] = value
-        elif not multiple:
+        elif not multiple or not isinstance(cur_value, list):
           raise datastore_errors.Error(
             'Property %s is corrupt in the datastore; it has multiple '
             'values, but is not marked as multiply valued.' % name)
@@ -850,6 +901,7 @@ class Query(dict):
   __compile = None
 
   __cursor = None
+  __end_cursor = None
 
   __filter_order = None
   __filter_counter = 0
@@ -858,7 +910,8 @@ class Query(dict):
   __inequality_count = 0
 
   def __init__(self, kind=None, filters={}, _app=None, keys_only=False,
-               compile=True, cursor=None, _namespace=None):
+               compile=True, cursor=None, namespace=None, end_cursor=None,
+               **kwds):
     """Constructor.
 
     Raises BadArgumentError if kind is not a string. Raises BadValueError or
@@ -870,7 +923,20 @@ class Query(dict):
       kind: string
       filters: dict
       keys_only: boolean
+      namespace: string
     """
+
+    _namespace = kwds.pop('_namespace', None)
+    if kwds:
+      raise datastore_errors.BadArgumentError(
+          'Excess keyword arguments ' + repr(kwds))
+
+    if namespace is None:
+      namespace = _namespace
+    elif _namespace is not None:
+        raise datastore_errors.BadArgumentError(
+            "Must not set both _namespace and namespace parameters.")
+
     if kind is not None:
       datastore_types.ValidateString(kind, 'kind',
                                      datastore_errors.BadArgumentError)
@@ -881,10 +947,11 @@ class Query(dict):
     self.update(filters)
 
     self.__app = datastore_types.ResolveAppId(_app)
-    self.__namespace = datastore_types.ResolveNamespace(_namespace)
+    self.__namespace = datastore_types.ResolveNamespace(namespace)
     self.__keys_only = keys_only
     self.__compile = compile
     self.__cursor = cursor
+    self.__end_cursor = end_cursor
 
   def Order(self, *orderings):
     """Specify how the query results should be sorted.
@@ -1436,8 +1503,9 @@ class Query(dict):
       order.set_direction(direction)
 
     if self.__cursor:
-      pb.mutable_compiled_cursor().CopyFrom(self.__cursor);
-
+      pb.mutable_compiled_cursor().CopyFrom(self.__cursor)
+    if self.__end_cursor:
+      pb.mutable_end_compiled_cursor().CopyFrom(self.__end_cursor)
     return pb
 
 
@@ -2172,9 +2240,8 @@ def RunInTransactionCustomRetries(retries, function, *args, **kwargs):
             _MakeSyncCall('datastore_v3', 'Rollback',
                           tx.handle, api_base_pb.VoidProto())
           except:
-            exc_info = sys.exc_info()
             logging.info('Exception sending Rollback:\n' +
-                         ''.join(traceback.format_exception(*exc_info)))
+                         traceback.format_exc())
 
         type, value, trace = original_exception
         if type is datastore_errors.Rollback:
@@ -2410,16 +2477,35 @@ def _ToDatastoreError(err):
   Returns:
     a subclass of datastore_errors.Error
   """
-  errors = {
-    datastore_pb.Error.BAD_REQUEST: datastore_errors.BadRequestError,
-    datastore_pb.Error.CONCURRENT_TRANSACTION:
-      datastore_errors.TransactionFailedError,
-    datastore_pb.Error.INTERNAL_ERROR: datastore_errors.InternalError,
-    datastore_pb.Error.NEED_INDEX: datastore_errors.NeedIndexError,
-    datastore_pb.Error.TIMEOUT: datastore_errors.Timeout,
-    }
+  return _DatastoreExceptionFromErrorCodeAndDetail(err.application_error,
+                                                   err.error_detail)
 
-  if err.application_error in errors:
-    return errors[err.application_error](err.error_detail)
+
+def _DatastoreExceptionFromErrorCodeAndDetail(error, detail):
+  """Converts a datastore_pb.Error into a datastore_errors.Error.
+
+  Args:
+    error: A member of the datastore_pb.Error enumeration.
+    detail: A string providing extra details about the error.
+
+  Returns:
+    A subclass of datastore_errors.Error.
+  """
+  exception_class = {
+      datastore_pb.Error.BAD_REQUEST: datastore_errors.BadRequestError,
+      datastore_pb.Error.CONCURRENT_TRANSACTION:
+        datastore_errors.TransactionFailedError,
+      datastore_pb.Error.INTERNAL_ERROR: datastore_errors.InternalError,
+      datastore_pb.Error.NEED_INDEX: datastore_errors.NeedIndexError,
+      datastore_pb.Error.TIMEOUT: datastore_errors.Timeout,
+      datastore_pb.Error.BIGTABLE_ERROR: datastore_errors.Timeout,
+      datastore_pb.Error.COMMITTED_BUT_STILL_APPLYING:
+        datastore_errors.CommittedButStillApplying,
+      datastore_pb.Error.CAPABILITY_DISABLED:
+        apiproxy_errors.CapabilityDisabledError,
+  }.get(error, datastore_errors.Error)
+
+  if detail is None:
+    return exception_class()
   else:
-    return datastore_errors.Error(err.error_detail)
+    return exception_class(detail)

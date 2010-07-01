@@ -204,12 +204,14 @@ def GetVersionObject(isfile=os.path.isfile, open_fn=open):
   return version
 
 
-def RetryWithBackoff(initial_delay, backoff_factor, max_tries, callable_func):
+def RetryWithBackoff(initial_delay, backoff_factor, max_delay, max_tries,
+                     callable_func):
   """Calls a function multiple times, backing off more and more each time.
 
   Args:
     initial_delay: Initial delay after first try, in seconds.
     backoff_factor: Delay will be multiplied by this factor after each try.
+    max_delay: Max delay factor.
     max_tries: Maximum number of tries.
     callable_func: The method to call, will pass no arguments.
 
@@ -220,12 +222,18 @@ def RetryWithBackoff(initial_delay, backoff_factor, max_tries, callable_func):
     Whatever the function raises--an exception will immediately stop retries.
   """
   delay = initial_delay
-  while not callable_func() and max_tries > 0:
+  if callable_func():
+    return True
+  while max_tries > 1:
     StatusUpdate('Will check again in %s seconds.' % delay)
     time.sleep(delay)
     delay *= backoff_factor
+    if max_delay and delay > max_delay:
+      delay = max_delay
     max_tries -= 1
-  return max_tries > 0
+    if callable_func():
+      return True
+  return False
 
 
 def _VersionList(release):
@@ -554,7 +562,7 @@ class CronEntryUpload(object):
   def DoUpload(self):
     """Uploads the cron entries."""
     StatusUpdate('Uploading cron entries.')
-    self.server.Send('/api/datastore/cron/update',
+    self.server.Send('/api/cron/update',
                      app_id=self.config.application,
                      version=self.config.version,
                      payload=self.cron.ToYAML())
@@ -603,6 +611,11 @@ class DosEntryUpload(object):
 
   def DoUpload(self):
     """Uploads the dos entries."""
+    StatusUpdate('Uploading DOS entries.')
+    self.server.Send('/api/dos/update',
+                     app_id=self.config.application,
+                     version=self.config.version,
+                     payload=self.dos.ToYAML())
 
 
 class IndexOperation(object):
@@ -764,7 +777,8 @@ class LogsRequester(object):
   """Provide facilities to export request logs."""
 
   def __init__(self, server, config, output_file,
-               num_days, append, severity, now, vhost, include_vhost):
+               num_days, append, severity, end, vhost, include_vhost,
+               include_all=None, time_func=time.time):
     """Constructor.
 
     Args:
@@ -775,9 +789,12 @@ class LogsRequester(object):
       num_days: Number of days worth of logs to export; 0 for all available.
       append: True if appending to an existing file.
       severity: App log severity to request (0-4); None for no app logs.
-      now: POSIX timestamp used for calculating valid dates for num_days.
+      end: date object representing last day of logs to return.
       vhost: The virtual host of log messages to get. None for all hosts.
       include_vhost: If true, the virtual host is included in log messages.
+      include_all: If true, we add to the log message everything we know
+        about the request.
+      time_func: Method that return a timestamp representing now (for testing).
     """
     self.server = server
     self.config = config
@@ -787,21 +804,25 @@ class LogsRequester(object):
     self.severity = severity
     self.vhost = vhost
     self.include_vhost = include_vhost
+    self.include_all = include_all
     self.version_id = self.config.version + '.1'
     self.sentinel = None
     self.write_mode = 'w'
     if self.append:
       self.sentinel = FindSentinel(self.output_file)
       self.write_mode = 'a'
+
+    self.skip_until = False
+    now = PacificDate(time_func())
+    if end < now:
+      self.skip_until = end
+    else:
+      end = now
+
     self.valid_dates = None
     if self.num_days:
-      patterns = []
-      now = PacificTime(now)
-      for i in xrange(self.num_days):
-        then = time.gmtime(now - 24*3600 * i)
-        patterns.append(re.escape(time.strftime('%d/%m/%Y', then)))
-        patterns.append(re.escape(time.strftime('%d/%b/%Y', then)))
-      self.valid_dates = re.compile(r'[^[]+\[(' + '|'.join(patterns) + r'):')
+      start = end - datetime.timedelta(self.num_days - 1)
+      self.valid_dates = (start, end)
 
   def DownloadLogs(self):
     """Download the requested logs.
@@ -813,13 +834,14 @@ class LogsRequester(object):
     StatusUpdate('Downloading request logs for %s %s.' %
                  (self.config.application, self.version_id))
     tf = tempfile.TemporaryFile()
-    offset = None
+    last_offset = None
     try:
       while True:
         try:
-          offset = self.RequestLogLines(tf, offset)
-          if not offset:
+          new_offset = self.RequestLogLines(tf, last_offset)
+          if not new_offset or new_offset == last_offset:
             break
+          last_offset = new_offset
         except KeyboardInterrupt:
           StatusUpdate('Keyboard interrupt; saving data downloaded so far.')
           break
@@ -858,7 +880,7 @@ class LogsRequester(object):
     logging.info('Request with offset %r.', offset)
     kwds = {'app_id': self.config.application,
             'version': self.version_id,
-            'limit': 100,
+            'limit': 1000,
            }
     if offset:
       kwds['offset'] = offset
@@ -868,6 +890,8 @@ class LogsRequester(object):
       kwds['vhost'] = str(self.vhost)
     if self.include_vhost is not None:
       kwds['include_vhost'] = str(self.include_vhost)
+    if self.include_all is not None:
+      kwds['include_all'] = str(self.include_all)
     response = self.server.Send('/api/request_logs', payload=None, **kwds)
     response = response.replace('\r', '\0')
     lines = response.splitlines()
@@ -882,19 +906,61 @@ class LogsRequester(object):
       del lines[-1]
     valid_dates = self.valid_dates
     sentinel = self.sentinel
+    skip_until = self.skip_until
     len_sentinel = None
     if sentinel:
       len_sentinel = len(sentinel)
     for line in lines:
-      if ((sentinel and
-           line.startswith(sentinel) and
-           line[len_sentinel : len_sentinel+1] in ('', '\0')) or
-          (valid_dates and not valid_dates.match(line))):
+      if (sentinel and
+          line.startswith(sentinel) and
+          line[len_sentinel : len_sentinel+1] in ('', '\0')):
+        return None
+
+      linedate = DateOfLogLine(line)
+      if not linedate:
+        continue
+
+      if skip_until:
+        if linedate > skip_until:
+          continue
+        else:
+          self.skip_until = skip_until = False
+
+      if valid_dates and not valid_dates[0] <= linedate <= valid_dates[1]:
         return None
       tf.write(line + '\n')
     if not lines:
       return None
     return offset
+
+
+def DateOfLogLine(line):
+  """Returns a date object representing the log line's timestamp.
+
+  Args:
+    line: a log line string.
+  Returns:
+    A date object representing the timestamp or None if parsing fails.
+  """
+  m = re.compile(r'[^[]+\[(\d+/[A-Za-z]+/\d+):[^\d]*').match(line)
+  if not m:
+    return None
+  try:
+    return datetime.date(*time.strptime(m.group(1), '%d/%b/%Y')[:3])
+  except ValueError:
+    return None
+
+
+def PacificDate(now):
+  """For a UTC timestamp, return the date in the US/Pacific timezone.
+
+  Args:
+    now: A posix timestamp giving current UTC time.
+
+  Returns:
+    A date object representing what day it is in the US/Pacific timezone.
+  """
+  return datetime.date(*time.gmtime(PacificTime(now))[:3])
 
 
 def PacificTime(now):
@@ -1073,7 +1139,7 @@ class UploadBatcher(object):
                         'Content-Transfer-Encoding: 8bit',
                         '',
                         payload,
-                        ])
+                       ])
       parts.append(part)
     parts.insert(0,
                  'MIME-Version: 1.0\n'
@@ -1314,6 +1380,38 @@ class AppVersionUpload(object):
     else:
       self.blob_batcher.AddToBatch(path, payload, mime_type)
 
+  def Precompile(self):
+    """Handle bytecode precompilation."""
+    StatusUpdate('Precompilation starting.')
+    files = []
+    while True:
+      if files:
+        StatusUpdate('Precompilation: %d files left.' % len(files))
+      files = self.PrecompileBatch(files)
+      if not files:
+        break
+    StatusUpdate('Precompilation completed.')
+
+  def PrecompileBatch(self, files):
+    """Precompile a batch of files.
+
+    Args:
+      files: Either an empty list (for the initial request) or a list
+        of files to be precompiled.
+
+    Returns:
+      Either an empty list (if no more files need to be precompiled)
+      or a list of files to be precompiled subsequently.
+    """
+    payload = LIST_DELIMITER.join(files)
+    response = self.server.Send('/api/appversion/precompile',
+                                app_id=self.app_id,
+                                version=self.version,
+                                payload=payload)
+    if not response:
+      return []
+    return response.split(LIST_DELIMITER)
+
   def Commit(self):
     """Commits the transaction, making the new app version available.
 
@@ -1331,7 +1429,7 @@ class AppVersionUpload(object):
 
     try:
       self.Deploy()
-      if not RetryWithBackoff(1, 2, 8, self.IsReady):
+      if not RetryWithBackoff(1, 2, 60, 20, self.IsReady):
         logging.warning('Version still not ready to serve, aborting.')
         raise Exception('Version not ready.')
       self.StartServing()
@@ -1456,6 +1554,10 @@ class AppVersionUpload(object):
         self.file_batcher.Flush()
         self.blob_batcher.Flush()
         StatusUpdate('Uploaded %d files and blobs' % num_files)
+
+      if (self.config.derived_file_type and
+          appinfo.PYTHON_PRECOMPILED in self.config.derived_file_type):
+        self.Precompile()
 
       self.Commit()
 
@@ -1794,7 +1896,7 @@ class AppCfgApp(object):
       email = self.options.email
       if email is None:
         email = 'test@example.com'
-        logging.info('Using debug user %s.  Override with --email' % email)
+        logging.info('Using debug user %s.  Override with --email', email)
       server = self.rpc_server_class(
           self.options.server,
           lambda: (email, 'password'),
@@ -2121,7 +2223,7 @@ class AppCfgApp(object):
 
     try:
       end_date = self._ParseEndDate(self.options.end_date)
-    except ValueError:
+    except (TypeError, ValueError):
       self.parser.error('End date must be in the format YYYY-MM-DD.')
 
     basepath = self.args[0]
@@ -2133,24 +2235,24 @@ class AppCfgApp(object):
                                    self.options.severity,
                                    end_date,
                                    self.options.vhost,
-                                   self.options.include_vhost)
+                                   self.options.include_vhost,
+                                   self.options.include_all)
     logs_requester.DownloadLogs()
 
   def _ParseEndDate(self, date, time_func=time.time):
-    """Translates a user-readable end date to a POSIX timestamp.
+    """Translates an ISO 8601 date to a date object.
 
     Args:
-      date: A utc date string as YYYY-MM-DD.
+      date: A date string as YYYY-MM-DD.
       time_func: time.time() function for testing.
 
     Returns:
-      A POSIX timestamp representing the last moment of that day.
-      If no date is given, returns a timestamp representing now.
+      A date object representing the last day of logs to get.
+      If no date is given, returns today in the US/Pacific timezone.
     """
     if not date:
-      return time_func()
-    struct_time = time.strptime('%s' % date, '%Y-%m-%d')
-    return calendar.timegm(struct_time) + 86400
+      return PacificDate(time_func())
+    return datetime.date(*[int(i) for i in date.split('-')])
 
   def _RequestLogsOptions(self, parser):
     """Adds request_logs-specific options to 'parser'.
@@ -2161,7 +2263,7 @@ class AppCfgApp(object):
     parser.add_option('-n', '--num_days', type='int', dest='num_days',
                       action='store', default=None,
                       help='Number of days worth of log data to get. '
-                      'The cut-off point is midnight UTC. '
+                      'The cut-off point is midnight US/Pacific. '
                       'Use 0 to get all available logs. '
                       'Default is 1, unless --append is also given; '
                       'then the default is 0.')
@@ -2180,6 +2282,9 @@ class AppCfgApp(object):
     parser.add_option('--include_vhost', dest='include_vhost',
                       action='store_true', default=False,
                       help='Include virtual host in log messages.')
+    parser.add_option('--include_all', dest='include_all',
+                      action='store_true', default=None,
+                      help='Include everything in log messages.')
     parser.add_option('--end_date', dest='end_date',
                       action='store', default='',
                       help='End date (as YYYY-MM-DD) of period for log data. '
@@ -2226,7 +2331,7 @@ class AppCfgApp(object):
 
   def _CheckRequiredLoadOptions(self):
     """Checks that upload/download options are present."""
-    for option in ['filename', 'kind', 'config_file']:
+    for option in ['filename',]:
       if getattr(self.options, option) is None:
         self.parser.error('Option \'%s\' is required.' % option)
     if not self.options.url:
@@ -2273,18 +2378,20 @@ class AppCfgApp(object):
 
   def _SetupLoad(self):
     """Performs common verification and set up for upload and download."""
-    if len(self.args) != 1:
-      self.parser.error('Expected <directory> argument.')
+    if len(self.args) != 1 and not self.options.url:
+      self.parser.error('Expected either --url or a single <directory> '
+                        'argument.')
 
-    basepath = self.args[0]
-    appyaml = self._ParseAppYaml(basepath)
+    if len(self.args) == 1:
+      basepath = self.args[0]
+      appyaml = self._ParseAppYaml(basepath)
 
-    self.options.app_id = appyaml.application
+      self.options.app_id = appyaml.application
 
-    if not self.options.url:
-      url = self.InferRemoteApiUrl(appyaml)
-      if url is not None:
-        self.options.url = url
+      if not self.options.url:
+        url = self.InferRemoteApiUrl(appyaml)
+        if url is not None:
+          self.options.url = url
 
     self._CheckRequiredLoadOptions()
 
@@ -2326,6 +2433,8 @@ class AppCfgApp(object):
                      'dry_run',
                      'dump',
                      'restore',
+                     'namespace',
+                     'create_config',
                      )])
 
   def PerformDownload(self, run_fn=None):
@@ -2341,11 +2450,12 @@ class AppCfgApp(object):
     StatusUpdate('Downloading data records.')
 
     args = self._MakeLoaderArgs()
-    args['download'] = True
+    args['download'] = bool(args['config_file'])
     args['has_header'] = False
     args['map'] = False
-    args['dump'] = False
+    args['dump'] = not args['config_file']
     args['restore'] = False
+    args['create_config'] = False
 
     run_fn(args)
 
@@ -2365,7 +2475,30 @@ class AppCfgApp(object):
     args['download'] = False
     args['map'] = False
     args['dump'] = False
+    args['restore'] = not args['config_file']
+    args['create_config'] = False
+
+    run_fn(args)
+
+  def CreateBulkloadConfig(self, run_fn=None):
+    """Create a bulkloader config via the bulkloader wizard.
+
+    Args:
+      run_fn: Function to invoke the bulkloader, used for testing.
+    """
+    if run_fn is None:
+      run_fn = self.RunBulkloader
+    self._SetupLoad()
+
+    StatusUpdate('Creating bulkloader configuration.')
+
+    args = self._MakeLoaderArgs()
+    args['download'] = False
+    args['has_header'] = False
+    args['map'] = False
+    args['dump'] = False
     args['restore'] = False
+    args['create_config'] = True
 
     run_fn(args)
 
@@ -2379,12 +2512,9 @@ class AppCfgApp(object):
                       action='store',
                       help='The name of the file containing the input data.'
                       ' (Required)')
-    parser.add_option('--config_file', type='string', dest='config_file',
-                      action='store',
-                      help='Name of the configuration file. (Required)')
     parser.add_option('--kind', type='string', dest='kind',
                       action='store',
-                      help='The kind of the entities to store. (Required)')
+                      help='The kind of the entities to store.')
     parser.add_option('--url', type='string', dest='url',
                       action='store',
                       help='The location of the remote_api endpoint.')
@@ -2430,6 +2560,9 @@ class AppCfgApp(object):
                       ' skipped')
     parser.add_option('--loader_opts', type='string', dest='loader_opts',
                       help='A string to pass to the Loader.initialize method.')
+    parser.add_option('--config_file', type='string', dest='config_file',
+                      action='store',
+                      help='Name of the configuration file.')
 
   def _PerformDownloadOptions(self, parser):
     """Adds 'download_data' specific options to the 'parser' passed in.
@@ -2445,6 +2578,17 @@ class AppCfgApp(object):
                       dest='result_db_filename',
                       action='store',
                       help='Database to write entities to for download.')
+    parser.add_option('--config_file', type='string', dest='config_file',
+                      action='store',
+                      help='Name of the configuration file.')
+
+  def _CreateBulkloadConfigOptions(self, parser):
+    """Adds 'download_data' specific options to the 'parser' passed in.
+
+    Args:
+      parser: An instance of OptionsParser.
+    """
+    self._PerformLoadOptions(parser)
 
   class Action(object):
     """Contains information about a command line action.
@@ -2526,14 +2670,13 @@ in production as well as restart any indexes that were not completed."""),
 The 'update_queue' command will update any new, removed or changed task queue
 definitions from the optional queue.yaml file."""),
 
-
-
-
-
-
-
-
-
+      'update_dos': Action(
+          function='UpdateDos',
+          usage='%prog [options] update_dos <directory>',
+          short_desc='Update application dos definitions.',
+          long_desc="""
+The 'update_dos' command will update any new, removed or changed dos
+definitions from the optional dos.yaml file."""),
 
       'vacuum_indexes': Action(
           function='VacuumIndexes',
@@ -2592,6 +2735,15 @@ uploads them into your application's datastore."""),
           long_desc="""
 The 'download_data' command downloads datastore entities and writes them to
 file as CSV or developer defined format."""),
+
+      'create_bulkloader_config': Action(
+          function='CreateBulkloadConfig',
+          usage='%prog [options] create_bulkload_config <directory>',
+          options=_CreateBulkloadConfigOptions,
+          short_desc='Create a bulkloader.yaml from a running application.',
+          long_desc="""
+The 'create_bulkloader_config' command creates a bulkloader.yaml configuration
+template for use with upload_data or download_data."""),
 
 
 

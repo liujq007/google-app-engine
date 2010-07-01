@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""Sample AppStats Configuration.
+"""Sample Appstats Configuration.
 
 There are four sections:
 
@@ -28,11 +28,13 @@ There are four sections:
 
 
 import logging
+import random
+import re
 
 # 0) WSGI middleware declaration.
 
 # Only use this if you're not Django; with Django, it's easier to add
-#   'google.appengine.ext.appstats.recording.AppStatsDjangoMiddleware',
+#   'google.appengine.ext.appstats.recording.AppstatsDjangoMiddleware',
 # to your Django settings.py file.
 
 # # def webapp_add_wsgi_middleware(app):
@@ -156,9 +158,9 @@ appstats_FILTER_LIST = []
 # above) *and* random.random() < RECORD_FRACTION.
 
 def appstats_should_record(env):
-  if config.FILTER_LIST:
-    logging.debug('FILTER_LIST: %r', config.FILTER_LIST)
-    for filter_dict in config.FILTER_LIST:
+  if appstats_FILTER_LIST:
+    logging.debug('FILTER_LIST: %r', appstats_FILTER_LIST)
+    for filter_dict in appstats_FILTER_LIST:
       for key, regex in filter_dict.iteritems():
         negated = isinstance(regex, str) and regex.startswith('!')
         if negated:
